@@ -12,6 +12,7 @@ export function createInitialWorkspace(): Workspace {
   const plans = recalculatePlans(clone(samplePlans));
   return {
     plans,
+    changeOrders: [],
     activePlanId: plans[0].id,
     comparePlanId: plans[1].id,
     selectedSceneId: plans[0].scenes[0].id,
@@ -42,6 +43,8 @@ export type EditorAction =
 
 function normalizeWorkspace(workspace: Workspace) {
   recalculatePlans(workspace.plans);
+  // 兼容旧版本草稿：没有变更单字段时补空数组
+  if (!Array.isArray(workspace.changeOrders)) workspace.changeOrders = [];
   const active = workspace.plans.find((plan) => plan.id === workspace.activePlanId) ?? workspace.plans[0];
   if (!active) return workspace;
   workspace.activePlanId = active.id;
