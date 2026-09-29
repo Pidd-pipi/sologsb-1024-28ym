@@ -60,6 +60,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleDot,
+  ClipboardList,
   Clock3,
   Copy,
   GripVertical,
@@ -79,7 +80,21 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  approveOrder,
+  buildOrderFields,
+  changeOrderStatusMeta,
+  changeableFieldNames,
+  changeableFields,
+  createOrder,
+  findOrderTarget,
+  rejectOrder,
+  resubmitOrder,
+  withdrawOrder,
+  type FieldDraft
+} from './changeOrders';
+import { ChangeOrderDialog, ChangeOrderPanel } from './ChangeOrderUI';
 import {
   colorPresets,
   detectConflicts,
@@ -96,7 +111,7 @@ import {
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole, Workspace } from './types';
+import type { Cue, CueConflict, FieldChangeOrder, LightingPlan, Scene, UserRole, Workspace } from './types';
 
 const statusColors = {
   draft: 'orange',
@@ -112,6 +127,26 @@ function conflictLabel(conflict: CueConflict) {
     'duplicate-position': '灯位重复',
     duration: '时间异常'
   }[conflict.type];
+}
+
+function fieldLabelOf(field: keyof Cue) {
+  return {
+    channel: '控制通道',
+    brightness: '亮度',
+    fadeIn: '渐入',
+    hold: '保持',
+    fadeOut: '渐出'
+  }[field as 'channel'] ?? String(field);
+}
+
+/** 从检查器草稿生成变更单字段勾选状态：与现值不同的受控字段自动勾选 */
+function draftFromCueChanges(base: Cue, draft: Cue): FieldDraft {
+  return Object.fromEntries(
+    changeableFields.map((meta) => {
+      const changed = !Object.is(draft[meta.field], base[meta.field]);
+      return [meta.field, { checked: changed, value: String(draft[meta.field]) }];
+    })
+  ) as FieldDraft;
 }
 
 interface SortableCueRowProps {
@@ -252,11 +287,12 @@ interface InspectorProps {
   canEdit: boolean;
   conflicts: CueConflict[];
   onApply: (draft: Cue) => void;
+  onSubmitChangeOrder: (draft: Cue) => void;
   onDelete: () => void;
   onSelectCue: (cueId: string) => void;
 }
 
-function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
+function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onSubmitChangeOrder, onDelete, onSelectCue }: InspectorProps) {
   const [draft, setDraft] = useState<Cue | null>(cue ? structuredClone(cue) : null);
 
   useEffect(() => {
@@ -278,6 +314,21 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
     setDraft((current) => (current ? { ...current, [key]: value } : current));
   };
 
+  const isProgrammer = workspace.role === 'programmer';
+  const safeDraft: Cue = draft;
+  const changedControlledFields = changeableFieldNames.filter((key) => !Object.is(safeDraft[key], cue[key]));
+  const pendingOrders = workspace.changeOrders.filter(
+    (order) => order.cueId === cue.id && (order.status === 'pending' || order.status === 'conflict')
+  );
+
+  function handlePrimaryAction() {
+    if (isProgrammer && changedControlledFields.length) {
+      onSubmitChangeOrder(safeDraft);
+    } else {
+      onApply(safeDraft);
+    }
+  }
+
   return (
     <VStack align="stretch" spacing={4}>
       <Flex align="center">
@@ -296,6 +347,13 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
             {scene.frozen ? '该场次已冻结。解除冻结后才能修改。' : '当前角色只能查看或执行场次冻结，不能修改提示参数。'}
           </AlertDescription>
         </Alert>
+      ) : isProgrammer ? (
+        <Alert status="info" borderRadius="lg">
+          <AlertIcon />
+          <AlertDescription fontSize="sm">
+            编程执行直接应用仅改名称、灯位、颜色、备注等字段；通道、亮度与渐变的调整会生成字段变更单，需灯光设计同意后合入。
+          </AlertDescription>
+        </Alert>
       ) : null}
 
       <SimpleGrid columns={2} spacing={3}>
@@ -312,7 +370,10 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
           <Input id="cue-position" value={draft.position} isDisabled={!canEdit} onChange={(event) => update('position', event.target.value)} />
         </FormControl>
         <FormControl>
-          <FormLabel htmlFor="cue-channel">控制通道</FormLabel>
+          <FormLabel htmlFor="cue-channel">
+            控制通道
+            {isProgrammer ? <Tag size="sm" colorScheme="amber" mt={-1} ml={1}>受控</Tag> : null}
+          </FormLabel>
           <Input id="cue-channel" value={draft.channel} isDisabled={!canEdit} onChange={(event) => update('channel', event.target.value)} />
         </FormControl>
         <FormControl>
@@ -339,7 +400,10 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
       </SimpleGrid>
 
       <FormControl>
-        <FormLabel>亮度 {draft.brightness}%</FormLabel>
+        <FormLabel>
+          亮度 {draft.brightness}%
+          {isProgrammer ? <Tag size="sm" colorScheme="amber" ml={2}>受控 · 需变更单</Tag> : null}
+        </FormLabel>
         <input
           aria-label="提示亮度"
           type="range"
@@ -359,7 +423,10 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
           ['fadeOut', '渐出']
         ] as const).map(([key, label]) => (
           <FormControl key={key}>
-            <FormLabel htmlFor={`cue-${key}`}>{label}（秒）</FormLabel>
+            <FormLabel htmlFor={`cue-${key}`}>
+              {label}（秒）
+              {isProgrammer ? <Tag size="sm" colorScheme="amber" mt={-1} ml={1}>受控</Tag> : null}
+            </FormLabel>
             <NumberInput
               id={`cue-${key}`}
               min={0}
@@ -451,14 +518,50 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
       )}
 
       <HStack>
-        <Button colorScheme="amber" isDisabled={!canEdit} leftIcon={<Save size={16} />} onClick={() => onApply(draft)}>
-          应用参数并重算
+        <Button
+          colorScheme="amber"
+          isDisabled={!canEdit}
+          leftIcon={isProgrammer && changedControlledFields.length ? <ClipboardList size={16} /> : <Save size={16} />}
+          onClick={handlePrimaryAction}
+        >
+          {isProgrammer && changedControlledFields.length
+            ? `提交变更单（${changedControlledFields.length} 项受控参数）`
+            : '应用参数并重算'}
         </Button>
+        {isProgrammer && canEdit ? (
+          <Button
+            variant="outline"
+            colorScheme="amber"
+            isDisabled={!canEdit}
+            leftIcon={<ClipboardList size={15} />}
+            onClick={() => onSubmitChangeOrder(draft)}
+          >
+            仅发起变更单
+          </Button>
+        ) : null}
         <Spacer />
         <Button colorScheme="red" variant="ghost" isDisabled={!canEdit} leftIcon={<Trash2 size={16} />} onClick={onDelete}>
           删除
         </Button>
       </HStack>
+
+      {pendingOrders.length ? (
+        <Box p={3} borderRadius="lg" borderWidth="1px" borderColor="amber.700" bg="amber.900">
+          <Text fontSize="xs" fontWeight="700" color="amber.200" mb={1}>本提示存在进行中的字段变更单</Text>
+          {pendingOrders.map((order) => {
+            const meta = changeOrderStatusMeta[order.status];
+            return (
+              <Flex key={order.id} fontSize="11px" color="whiteAlpha.700" align="center" gap={2}>
+                <Tag size="sm" colorScheme={meta.color as 'amber'}>{meta.label}</Tag>
+                <Text>
+                  {order.fields.filter((item) => item.checked).map((item) => fieldLabelOf(item.field)).join('、') || '无勾选字段'}
+                </Text>
+                <Text color="whiteAlpha.500">{new Date(order.submittedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</Text>
+              </Flex>
+            );
+          })}
+        </Box>
+      ) : null}
 
       <Divider />
       <Box>
@@ -572,6 +675,8 @@ export default function App() {
   const [online, setOnline] = useState(true);
   const [savedAt, setSavedAt] = useState('');
   const [syncMessage, setSyncMessage] = useState('离线草稿待命');
+  const [orderDialog, setOrderDialog] = useState<{ open: boolean; order?: FieldChangeOrder; initial?: FieldDraft }>({ open: false });
+  const conflictToastRef = useRef<Set<string>>(new Set());
   const toast = useToast();
   const workspace = state.workspace;
   const activePlan = findActivePlan(workspace);
@@ -586,6 +691,9 @@ export default function App() {
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
+  const planChangeOrders = workspace.changeOrders.filter((order) => order.planId === activePlan.id);
+  const pendingOrderCount = planChangeOrders.filter((order) => order.status === 'pending').length;
+  const conflictOrderCount = planChangeOrders.filter((order) => order.status === 'conflict').length;
 
   useEffect(() => {
     try {
@@ -621,8 +729,27 @@ export default function App() {
     };
   }, []);
 
-  function commit(label: string, mutate: (next: Workspace) => void) {
-    dispatch({ type: 'commit', label, mutate });
+  // 待审批变更单在某次提交后被标为冲突时给出提示（已修改字段保留新值，变更单留下重提）
+  useEffect(() => {
+    if (!hydrated) {
+      conflictToastRef.current = new Set(workspace.changeOrders.map((order) => order.id));
+      return;
+    }
+    for (const order of workspace.changeOrders) {
+      if (order.status === 'conflict' && !conflictToastRef.current.has(order.id)) {
+        toast({
+          title: `变更单字段冲突：${order.cueNumber} ${order.cueLabel}`,
+          description: `目标字段（${(order.conflictFields ?? []).map((field) => fieldLabelOf(field)).join('、')}）已被改动，现值保留；请现场核对后重提。`,
+          status: 'warning',
+          duration: 4200
+        });
+      }
+    }
+    conflictToastRef.current = new Set(workspace.changeOrders.map((order) => order.id));
+  }, [workspace.changeOrders, hydrated]);
+
+  function commit(label: string, mutate: (next: Workspace) => void, skipOrderScan = false) {
+    dispatch({ type: 'commit', label, mutate, skipOrderScan });
   }
 
   function reorderCue(activeId: string, overId: string) {
@@ -638,6 +765,7 @@ export default function App() {
   }
 
   function applyCue(draft: Cue) {
+    const asProgrammer = workspace.role === 'programmer';
     commit('应用提示参数并重算', (next) => {
       const cue = next.plans
         .find((plan) => plan.id === next.activePlanId)
@@ -645,9 +773,132 @@ export default function App() {
         ?.cues.find((item) => item.id === draft.id);
       if (!cue) return;
       const { startTime: _start, duration: _duration, endTime: _end, ...fields } = draft;
+      // 编程执行对通道、亮度、渐变的调整必须走字段变更单；直接应用时这些字段照旧
+      if (asProgrammer) {
+        for (const controlled of changeableFieldNames) delete fields[controlled];
+      }
       Object.assign(cue, fields);
     });
-    toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+    toast({
+      title: asProgrammer ? '非受控参数已应用' : '提示参数已应用',
+      description: asProgrammer ? '通道、亮度与渐变请通过字段变更单审批。' : '叠光与跟随关系已重新核对。',
+      status: 'success',
+      duration: 2000
+    });
+  }
+
+  function openNewOrder(initial?: FieldDraft) {
+    if (!selectedCue || !activeScene) return;
+    if (activeScene.frozen) {
+      toast({ title: '该场次已冻结，不能提交变更单', status: 'error' });
+      return;
+    }
+    if (workspace.role !== 'programmer' && workspace.role !== 'designer') {
+      toast({ title: '当前角色不能提交字段变更单', status: 'warning' });
+      return;
+    }
+    setOrderDialog({ open: true, initial });
+  }
+
+  function submitChangeOrderFromInspector(draft: Cue) {
+    if (!selectedCue) return;
+    openNewOrder(draftFromCueChanges(selectedCue, draft));
+  }
+
+  function submitOrderDialog(fields: ReturnType<typeof buildOrderFields>, reason: string) {
+    if (!activePlan || !activeScene || !selectedCue) return;
+    const checkedCount = fields.filter((item) => item.checked).length;
+    commit('提交字段变更单', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      const scene = plan?.scenes.find((item) => item.id === next.selectedSceneId);
+      const cue = scene?.cues.find((item) => item.id === next.selectedCueId);
+      if (plan && scene && cue) {
+        next.changeOrders.push(createOrder({ plan, scene, cue, fields, reason, submitterRole: next.role }));
+      }
+    }, true);
+    toast({
+      title: '字段变更单已提交',
+      description: `已勾选 ${checkedCount} 项参数，等待灯光设计审批。`,
+      status: 'success',
+      duration: 2400
+    });
+  }
+
+  function handleResubmitOrder(order: FieldChangeOrder) {
+    const { scene } = findOrderTarget(workspace, order);
+    if (scene?.frozen) {
+      toast({ title: '该场次已冻结，不能重提变更单', status: 'error' });
+      return;
+    }
+    setOrderDialog({ open: true, order });
+  }
+
+  function submitResubmit(fields: ReturnType<typeof buildOrderFields>, reason: string) {
+    const order = orderDialog.order;
+    if (!order) return;
+    commit('冲突变更单重新提交', (next) => {
+      resubmitOrder(next, order.id, fields, reason);
+    }, true);
+    toast({ title: '变更单已按当前值重提，等待设计审批', status: 'success' });
+  }
+
+  function handleApproveSafe(order: FieldChangeOrder) {
+    const { scene } = findOrderTarget(workspace, order);
+    if (scene?.frozen) {
+      toast({ title: '冻结场次不能批准变更单', status: 'error' });
+      return;
+    }
+    let outcome: { mergedCount: number; conflictCount: number } | null = null;
+    let failure = '';
+    dispatch({
+      type: 'commit',
+      label: '设计同意变更单并合入',
+      skipOrderScan: true,
+      mutate: (next) => {
+        const result = approveOrder(next, order.id, next.role);
+        if (result.ok) {
+          outcome = { mergedCount: result.mergedCount, conflictCount: result.conflictCount };
+        } else {
+          failure = result.reason;
+        }
+      }
+    });
+    const orderOutcome: { mergedCount: number; conflictCount: number } | null = outcome as {
+      mergedCount: number;
+      conflictCount: number;
+    } | null;
+    if (orderOutcome) {
+      toast({
+        title: `已合入 ${orderOutcome.mergedCount} 项字段`,
+        description: `叠光与跟随关系已重新核对，当前方案检测到 ${orderOutcome.conflictCount} 个冲突。`,
+        status: orderOutcome.conflictCount ? 'warning' : 'success',
+        duration: 3000
+      });
+    } else {
+      const message = {
+        drifted: '目标字段提交后已被改动，该单已转为冲突，请现场重提。',
+        frozen: '冻结场次不能批准。',
+        'not-pending': '该变更单已不在待审批状态。',
+        missing: '变更单或目标提示不存在。',
+        invalid: '申请值不合法，无法合入。'
+      }[failure] ?? '无法批准该变更单。';
+      toast({ title: '未能合入变更单', description: message, status: 'warning', duration: 3200 });
+    }
+  }
+
+  function handleReject(order: FieldChangeOrder) {
+    const note = window.prompt('退回原因（可选）：', '参数来源不清，请现场复核');
+    if (note === null) return;
+    commit('设计退回字段变更单', (next) => {
+      rejectOrder(next, order.id, next.role, note || undefined);
+    }, true);
+    toast({ title: '变更单已退回', status: 'info' });
+  }
+
+  function handleWithdraw(order: FieldChangeOrder) {
+    commit('撤回字段变更单', (next) => {
+      withdrawOrder(next, order.id);
+    }, true);
   }
 
   function deleteCue() {
@@ -801,10 +1052,12 @@ export default function App() {
   }
 
   function exportPlan() {
+    const orders = workspace.changeOrders.filter((order) => order.planId === activePlan.id);
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
       conflicts: activeConflicts,
+      changeOrders: orders,
       role: workspace.role
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
@@ -949,6 +1202,14 @@ export default function App() {
                   <Text fontSize="2xl" fontWeight="800" color={activeConflicts.length ? 'orange.300' : 'green.300'}>{activeConflicts.length}</Text>
                   <Text color="whiteAlpha.500" fontSize="xs">当前方案冲突</Text>
                 </Box>
+                <Box p={3} borderRadius="lg" bg="blackAlpha.200">
+                  <Text fontSize="2xl" fontWeight="800" color={pendingOrderCount ? 'amber.300' : 'whiteAlpha.600'}>{pendingOrderCount}</Text>
+                  <Text color="whiteAlpha.500" fontSize="xs">待审批变更单</Text>
+                </Box>
+                <Box p={3} borderRadius="lg" bg="blackAlpha.200">
+                  <Text fontSize="2xl" fontWeight="800" color={conflictOrderCount ? 'orange.300' : 'whiteAlpha.600'}>{conflictOrderCount}</Text>
+                  <Text color="whiteAlpha.500" fontSize="xs">变更单字段冲突</Text>
+                </Box>
               </SimpleGrid>
               <Button mt={3} w="full" colorScheme="blue" variant="outline" leftIcon={<SkipForward size={16} />} onClick={jumpIncomplete}>
                 下一未完成 / 阻断项
@@ -1074,6 +1335,12 @@ export default function App() {
               <TabList px={3} pt={2}>
                 <Tab>提示编辑</Tab>
                 <Tab>冲突 <Badge ml={1} colorScheme={activeConflicts.length ? 'orange' : 'green'}>{activeConflicts.length}</Badge></Tab>
+                <Tab>
+                  变更单
+                  <Badge ml={1} colorScheme={pendingOrderCount || conflictOrderCount ? 'orange' : 'green'}>
+                    {pendingOrderCount + conflictOrderCount}
+                  </Badge>
+                </Tab>
                 <Tab>关系图</Tab>
               </TabList>
               <TabPanels>
@@ -1087,6 +1354,7 @@ export default function App() {
                       canEdit={editable}
                       conflicts={activeCueConflicts}
                       onApply={applyCue}
+                      onSubmitChangeOrder={submitChangeOrderFromInspector}
                       onDelete={deleteCue}
                       onSelectCue={(cueId) => selectCue(activeScene.id, cueId)}
                     />
@@ -1097,6 +1365,22 @@ export default function App() {
                     conflicts={activeConflicts}
                     onSelect={(sceneId, cueId) => selectCue(sceneId, cueId)}
                   />
+                </TabPanel>
+                <TabPanel px={4} pb={5}>
+                  {activeScene ? (
+                    <ChangeOrderPanel
+                      workspace={workspace}
+                      activePlanId={activePlan.id}
+                      hasSelectedCue={Boolean(selectedCue)}
+                      role={workspace.role}
+                      onSubmitNew={() => openNewOrder()}
+                      onSelectCue={(sceneId, cueId) => selectCue(sceneId, cueId)}
+                      onApprove={handleApproveSafe}
+                      onReject={handleReject}
+                      onResubmit={handleResubmitOrder}
+                      onWithdraw={handleWithdraw}
+                    />
+                  ) : null}
                 </TabPanel>
                 <TabPanel px={4} pb={5}>
                   {activeScene ? (
@@ -1139,6 +1423,17 @@ export default function App() {
           </Box>
         </Box>
       </Grid>
+
+      <ChangeOrderDialog
+        isOpen={orderDialog.open}
+        onClose={() => setOrderDialog({ open: false })}
+        cue={selectedCue}
+        scene={activeScene}
+        role={workspace.role}
+        order={orderDialog.order}
+        initialDraft={orderDialog.initial}
+        onSubmit={orderDialog.order ? submitResubmit : submitOrderDialog}
+      />
 
       <Box as="footer" maxW="1920px" mx="auto" px={5} pb={7} color="whiteAlpha.400" fontSize="xs" textAlign="center">
         所有方案与草稿保存在当前浏览器。清除站点数据会删除灯光设计台内容。

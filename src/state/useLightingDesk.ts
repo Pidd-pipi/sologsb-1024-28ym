@@ -1,4 +1,5 @@
 import { useReducer } from 'react';
+import { markOrderConflicts } from '../changeOrders';
 import { recalculatePlans, samplePlans } from '../data';
 import type { Cue, EditorState, LightingPlan, Scene, UserRole, Workspace } from '../types';
 
@@ -16,7 +17,8 @@ export function createInitialWorkspace(): Workspace {
     comparePlanId: plans[1].id,
     selectedSceneId: plans[0].scenes[0].id,
     selectedCueId: plans[0].scenes[0].cues[0].id,
-    role: 'designer'
+    role: 'designer',
+    changeOrders: []
   };
 }
 
@@ -31,7 +33,7 @@ export function createInitialState(): EditorState {
 
 export type EditorAction =
   | { type: 'hydrate'; workspace: Workspace }
-  | { type: 'commit'; label: string; mutate: (workspace: Workspace) => void }
+  | { type: 'commit'; label: string; mutate: (workspace: Workspace) => void; skipOrderScan?: boolean }
   | { type: 'selectScene'; sceneId: string }
   | { type: 'selectCue'; sceneId: string; cueId: string }
   | { type: 'selectPlan'; planId: string }
@@ -42,6 +44,7 @@ export type EditorAction =
 
 function normalizeWorkspace(workspace: Workspace) {
   recalculatePlans(workspace.plans);
+  if (!workspace.changeOrders) workspace.changeOrders = [];
   const active = workspace.plans.find((plan) => plan.id === workspace.activePlanId) ?? workspace.plans[0];
   if (!active) return workspace;
   workspace.activePlanId = active.id;
@@ -70,6 +73,8 @@ export function lightingReducer(state: EditorState, action: EditorAction): Edito
       const next = clone(state.workspace);
       action.mutate(next);
       normalizeWorkspace(next);
+      // 任何参数/排序/删除提交后，待审批变更单若目标字段已被改动则转为冲突
+      if (!action.skipOrderScan) markOrderConflicts(next);
       const active = next.plans.find((plan) => plan.id === next.activePlanId);
       if (active) active.updatedAt = new Date().toISOString();
       return {
